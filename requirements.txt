@@ -1,3 +1,4 @@
 pandas
 robin-stocks
 python-dotenv
+openpyxl

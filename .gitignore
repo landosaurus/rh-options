@@ -5,7 +5,15 @@ __pycache__/
 
 # C extensions
 *.so
-
+*.csv
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+*.xlsm
+*.xlsb
+*.xlsm
+*.xlsb
 # Distribution / packaging
 .Python
 build/
