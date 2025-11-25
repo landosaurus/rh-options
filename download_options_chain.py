@@ -1,279 +1,233 @@
 #!/usr/bin/env python3
 """
-Download complete options chain data from Robinhood for any stock symbol.
-Fetches all available expiration dates with full market data including Greeks.
+OPTIMIZED: Download complete options chain data from Robinhood for any stock symbol.
+Uses batch API calls to reduce from ~3000+ calls to ~60-80 calls.
 
 Usage:
-    python download_options_chain.py NVDA
-    python download_options_chain.py TSLA
-    python download_options_chain.py AAPL --output my_data.csv
-
-    # Resume interrupted download:
-    python download_options_chain.py NVDA --continue --csv NVDA_options_chain_20231119_123456.csv
+    python download_options_chain_optimized.py NVDA
+    python download_options_chain_optimized.py TSLA
+    python download_options_chain_optimized.py AAPL --output my_data.csv
 """
 
 import robin_stocks.robinhood as rh
+from robin_stocks.robinhood.helper import request_get
 import pandas as pd
 from datetime import datetime
 import time
+import random
 import argparse
 import sys
 import os
-import json
+
+# Robinhood API endpoints
+MARKETDATA_OPTIONS_URL = 'https://api.robinhood.com/marketdata/options/'
+BATCH_SIZE = 50  # Robinhood allows ~50 instruments per batch request
+RATE_LIMIT_BASE = 1.0   # Base delay between batch requests (seconds)
+RATE_LIMIT_JITTER = 0.5  # Random jitter ± this amount (seconds)
+
 
 def login():
     """Login to Robinhood using stored credentials."""
-    print("🔐 Logging in to Robinhood...")
+    print("Logging in to Robinhood...")
     try:
         rh.login()
-        print("✅ Login successful")
+        print("Login successful")
         return True
     except Exception as e:
-        print(f"❌ Login failed: {e}")
-        print("\n💡 Make sure you've run setup_auth.py first to create your credentials")
+        print(f"Login failed: {e}")
+        print("\nMake sure you've run setup_auth.py first to create your credentials")
         return False
 
-def get_expiration_dates(symbol):
-    """Get all available expiration dates for a symbol."""
-    try:
-        chains = rh.options.get_chains(symbol=symbol)
-        if chains and 'expiration_dates' in chains:
-            return chains['expiration_dates']
-        return []
-    except Exception as e:
-        print(f"❌ Error getting expiration dates: {e}")
-        return []
 
-def get_completed_expirations(csv_file):
+def get_all_options_instruments(symbol):
     """
-    Get list of expiration dates already in the CSV file.
-    Since we only write to CSV after fully fetching an expiration,
-    any expiration in the file is complete.
-
-    Args:
-        csv_file: Path to existing CSV file
+    Get ALL option instruments for a symbol in one paginated call.
+    This is much faster than calling per-expiration.
 
     Returns:
-        Set of expiration dates in the file
+        List of option instrument dictionaries (without market data)
     """
-    if not os.path.exists(csv_file):
-        return set()
+    print(f"Fetching all option instruments for {symbol}...")
 
-    try:
-        df = pd.read_csv(csv_file)
-        if 'expiration_date' in df.columns:
-            return set(df['expiration_date'].unique())
-        return set()
-    except Exception as e:
-        print(f"⚠️  Warning: Could not read existing CSV: {e}")
-        return set()
+    # find_tradable_options without expiration date gets ALL options
+    options = rh.options.find_tradable_options(symbol)
 
-def fetch_options_for_expiration(symbol, exp_date):
+    if not options or options == [None]:
+        return []
+
+    # Filter out None values
+    options = [o for o in options if o is not None]
+    print(f"Found {len(options)} option instruments")
+
+    return options
+
+
+def get_batch_market_data(instrument_urls):
     """
-    Fetch ALL options for a single expiration date.
-    Data is kept in memory and only returned after complete fetch.
+    Fetch market data for multiple instruments in a single API call.
+    Robinhood API supports batching ~50 instruments per request.
 
     Args:
-        symbol: Stock ticker
-        exp_date: Expiration date (YYYY-MM-DD)
+        instrument_urls: List of instrument URLs
 
     Returns:
-        List of option records, or None if error
+        Dictionary mapping instrument URL to market data
     """
+    if not instrument_urls:
+        return {}
+
+    # Join URLs with comma for batch request
+    payload = {
+        "instruments": ",".join(instrument_urls)
+    }
+
     try:
-        # Get options for this expiration
-        options = rh.options.find_options_by_expiration(
-            inputSymbols=symbol,
-            expirationDate=exp_date,
-            optionType=None  # Both calls and puts
-        )
+        data = request_get(MARKETDATA_OPTIONS_URL, 'results', payload)
+        if not data:
+            return {}
 
-        if not options:
-            return []
+        # Create mapping from instrument URL to market data
+        result = {}
+        for item in data:
+            if item and 'instrument' in item:
+                result[item['instrument']] = item
 
-        batch_options = []
-
-        # Get market data for each option - keep in memory until all complete
-        for option in options:
-            try:
-                strike = float(option['strike_price'])
-                option_type = option['type']
-
-                # Get market data
-                market_data = rh.options.get_option_market_data_by_id(option['id'])
-
-                if market_data:
-                    record = {
-                        'symbol': symbol,
-                        'expiration_date': exp_date,
-                        'strike_price': strike,
-                        'option_type': option_type,
-                        'bid_price': market_data[0].get('bid_price', ''),
-                        'ask_price': market_data[0].get('ask_price', ''),
-                        'mark_price': market_data[0].get('mark_price', ''),
-                        'last_trade_price': market_data[0].get('last_trade_price', ''),
-                        'volume': market_data[0].get('volume', 0),
-                        'open_interest': market_data[0].get('open_interest', 0),
-                        'implied_volatility': market_data[0].get('implied_volatility', ''),
-                        'delta': market_data[0].get('delta', ''),
-                        'gamma': market_data[0].get('gamma', ''),
-                        'theta': market_data[0].get('theta', ''),
-                        'vega': market_data[0].get('vega', ''),
-                        'rho': market_data[0].get('rho', ''),
-                        'high_price': market_data[0].get('high_price', ''),
-                        'low_price': market_data[0].get('low_price', ''),
-                        'previous_close': market_data[0].get('previous_close_price', ''),
-                    }
-                    batch_options.append(record)
-            except Exception as e:
-                # Skip individual options that fail
-                continue
-
-        # Return all options only after complete fetch
-        return batch_options
-
+        return result
     except Exception as e:
-        print(f"  ⚠️  Error: {e}")
-        return None
+        print(f"  Error fetching batch market data: {e}")
+        return {}
 
-def download_full_chain(symbol, output_file=None, continue_mode=False):
+
+def download_full_chain_optimized(symbol, output_file=None):
     """
-    Download complete options chain for a symbol.
+    Download complete options chain using optimized batch API calls.
 
     Args:
         symbol: Stock ticker symbol (e.g., 'NVDA', 'TSLA')
         output_file: Optional custom output filename
-        continue_mode: If True, resume from existing CSV file
 
     Returns:
         Path to the created CSV file, or None if failed
     """
     symbol = symbol.upper()
 
-    print(f"\n📊 Downloading options chain for {symbol}")
+    print(f"\nDownloading options chain for {symbol} (OPTIMIZED)")
     print("=" * 60)
 
-    # Get expiration dates
-    print("📅 Fetching available expiration dates...")
-    expiration_dates = get_expiration_dates(symbol)
+    # Step 1: Get all option instruments at once
+    all_options = get_all_options_instruments(symbol)
 
-    if not expiration_dates:
-        print(f"❌ No expiration dates found for {symbol}")
+    if not all_options:
+        print(f"No options found for {symbol}")
         return None
 
-    print(f"✅ Found {len(expiration_dates)} expiration dates")
-    print(f"   Range: {expiration_dates[0]} to {expiration_dates[-1]}")
-    print()
+    # Count unique expirations
+    expirations = set(o.get('expiration_date') for o in all_options if o.get('expiration_date'))
+    print(f"Options span {len(expirations)} expiration dates")
 
     # Generate output filename if not provided
     if output_file is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_file = f'{symbol}_options_chain_{timestamp}.csv'
 
-    # Check for existing progress
-    completed_expirations = set()
-    is_first_write = True
-
-    if continue_mode and os.path.exists(output_file):
-        print(f"🔍 Checking existing file for completed expirations...")
-        completed_expirations = get_completed_expirations(output_file)
-
-        if completed_expirations:
-            is_first_write = False
-            print(f"🔄 Resuming download from existing file: {output_file}")
-            print(f"✅ Already completed: {len(completed_expirations)} expiration dates")
-            print(f"⏳ Remaining: {len(expiration_dates) - len(completed_expirations)} expiration dates")
-            print()
-    elif os.path.exists(output_file) and not continue_mode:
-        print(f"⚠️  Warning: File {output_file} already exists")
-        print(f"   Use --continue to resume, or specify a different output file")
-        return None
-
-    print(f"💾 Output file: {output_file}")
-    print(f"⏳ Starting download (this may take several minutes)...")
+    print(f"Output file: {output_file}")
+    print(f"Fetching market data in batches of {BATCH_SIZE}...")
     print()
 
-    total_options = 0
-    skipped = 0
-    fetched = 0
+    # Step 2: Collect all instrument URLs
+    instrument_urls = []
+    url_to_option = {}
 
-    for i, exp_date in enumerate(expiration_dates, 1):
-        # Skip already completed expirations
-        if exp_date in completed_expirations:
-            skipped += 1
-            print(f"[{i}/{len(expiration_dates)}] {exp_date} ⏭️  (already downloaded)")
-            continue
+    for option in all_options:
+        url = option.get('url')
+        if url:
+            instrument_urls.append(url)
+            url_to_option[url] = option
 
-        print(f"[{i}/{len(expiration_dates)}] Fetching {exp_date}...", end=' ', flush=True)
+    print(f"Total instruments to fetch market data: {len(instrument_urls)}")
 
-        # Fetch all options for this expiration (kept in memory)
-        options_data = fetch_options_for_expiration(symbol, exp_date)
+    # Step 3: Fetch market data in batches
+    total_batches = (len(instrument_urls) + BATCH_SIZE - 1) // BATCH_SIZE
+    all_market_data = {}
 
-        # Only write to CSV if fetch was successful and complete
-        if options_data is not None and len(options_data) > 0:
-            # Create DataFrame and sort
-            df = pd.DataFrame(options_data)
-            df = df.sort_values(['option_type', 'strike_price'])
+    for i in range(0, len(instrument_urls), BATCH_SIZE):
+        batch_num = i // BATCH_SIZE + 1
+        batch_urls = instrument_urls[i:i + BATCH_SIZE]
 
-            # Write to CSV (header only on first write)
-            mode = 'w' if is_first_write else 'a'
-            header = is_first_write
-            df.to_csv(output_file, mode=mode, header=header, index=False)
+        print(f"[Batch {batch_num}/{total_batches}] Fetching {len(batch_urls)} instruments...", end=' ', flush=True)
 
-            # Update counters
-            count = len(options_data)
-            total_options += count
-            fetched += 1
-            is_first_write = False
+        batch_data = get_batch_market_data(batch_urls)
+        all_market_data.update(batch_data)
 
-            print(f"✓ {count} options (Session total: {total_options})")
-        elif options_data is not None:
-            print("(no data)")
-        else:
-            print("❌ (fetch failed, will retry on resume)")
+        print(f"Got {len(batch_data)} results")
 
-        # Small delay to avoid rate limiting
-        time.sleep(0.5)
+        # Rate limit with jitter: random delay to mimic human behavior
+        if batch_num < total_batches:
+            delay = RATE_LIMIT_BASE + random.uniform(-RATE_LIMIT_JITTER, RATE_LIMIT_JITTER)
+            time.sleep(max(0.5, delay))  # Never go below 0.5s
+
+    print()
+    print(f"Successfully fetched market data for {len(all_market_data)} options")
+
+    # Step 4: Merge instrument data with market data and build records
+    print("Merging data and building records...")
+
+    records = []
+    for url, option in url_to_option.items():
+        market_data = all_market_data.get(url, {})
+
+        record = {
+            'symbol': symbol,
+            'expiration_date': option.get('expiration_date', ''),
+            'strike_price': float(option.get('strike_price', 0)),
+            'option_type': option.get('type', ''),
+            # Market data fields
+            'bid_price': market_data.get('bid_price', ''),
+            'ask_price': market_data.get('ask_price', ''),
+            'mark_price': market_data.get('mark_price', ''),
+            'last_trade_price': market_data.get('last_trade_price', ''),
+            'volume': market_data.get('volume', 0),
+            'open_interest': market_data.get('open_interest', 0),
+            'implied_volatility': market_data.get('implied_volatility', ''),
+            'delta': market_data.get('delta', ''),
+            'gamma': market_data.get('gamma', ''),
+            'theta': market_data.get('theta', ''),
+            'vega': market_data.get('vega', ''),
+            'rho': market_data.get('rho', ''),
+            'high_price': market_data.get('high_price', ''),
+            'low_price': market_data.get('low_price', ''),
+            'previous_close': market_data.get('previous_close_price', ''),
+        }
+        records.append(record)
+
+    # Step 5: Create DataFrame and save
+    df = pd.DataFrame(records)
+    df = df.sort_values(['expiration_date', 'option_type', 'strike_price'])
+    df.to_csv(output_file, index=False)
 
     print()
     print("=" * 60)
+    print(f"Download complete!")
+    print(f"File: {output_file}")
+    print(f"Total options: {len(df)}")
+    print(f"  Calls: {len(df[df['option_type'] == 'call'])}")
+    print(f"  Puts: {len(df[df['option_type'] == 'put'])}")
+    print(f"  Date range: {df['expiration_date'].min()} to {df['expiration_date'].max()}")
+    print(f"  Strike range: ${df['strike_price'].min():.2f} to ${df['strike_price'].max():.2f}")
+    print()
+    print(f"API calls made: ~{total_batches + 2} (vs ~{len(all_options)} with old method)")
 
-    if os.path.exists(output_file):
-        # Read final CSV to get summary stats
-        df = pd.read_csv(output_file)
+    return output_file
 
-        print(f"✅ Download complete!")
-        print(f"📁 File: {output_file}")
-        print(f"📊 Total options in file: {len(df)}")
-        print(f"   Calls: {len(df[df['option_type'] == 'call'])}")
-        print(f"   Puts: {len(df[df['option_type'] == 'put'])}")
-        print(f"   Date range: {df['expiration_date'].min()} to {df['expiration_date'].max()}")
-        print(f"   Strike range: ${df['strike_price'].min():.2f} to ${df['strike_price'].max():.2f}")
-
-        if continue_mode:
-            print(f"\n📈 Session stats:")
-            print(f"   Fetched this session: {fetched} expiration dates")
-            print(f"   Skipped (already had): {skipped} expiration dates")
-            print(f"   New options added: {total_options}")
-
-        return output_file
-    else:
-        print("❌ No options data retrieved")
-        return None
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Download complete options chain data from Robinhood',
+        description='Download complete options chain data from Robinhood (OPTIMIZED)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Fresh download:
-  python download_options_chain.py NVDA
-  python download_options_chain.py TSLA --output tsla_options.csv
-  python download_options_chain.py AAPL -o aapl_data.csv
-
-  # Resume interrupted download:
-  python download_options_chain.py NVDA --continue --csv NVDA_options_chain_20231119_123456.csv
+  python download_options_chain_optimized.py NVDA
+  python download_options_chain_optimized.py TSLA --output tsla_options.csv
 
 Note: You must run setup_auth.py first to authenticate with Robinhood.
         """
@@ -281,21 +235,11 @@ Note: You must run setup_auth.py first to authenticate with Robinhood.
 
     parser.add_argument('symbol',
                        help='Stock ticker symbol (e.g., NVDA, TSLA, AAPL)')
-    parser.add_argument('-o', '--output', '--csv',
+    parser.add_argument('-o', '--output',
                        dest='output',
                        help='Output CSV filename (default: auto-generated with timestamp)')
-    parser.add_argument('--continue', '--resume',
-                       dest='continue_mode',
-                       action='store_true',
-                       help='Resume from existing CSV file (requires --csv to specify the file)')
 
     args = parser.parse_args()
-
-    # Validate continue mode
-    if args.continue_mode and not args.output:
-        print("❌ Error: --continue requires --csv to specify the file to resume")
-        print("   Example: python download_options_chain.py NVDA --continue --csv NVDA_options_chain_20231119_123456.csv")
-        sys.exit(1)
 
     # Login first
     if not login():
@@ -303,24 +247,24 @@ Note: You must run setup_auth.py first to authenticate with Robinhood.
 
     # Download the data
     try:
-        output_file = download_full_chain(args.symbol, args.output, args.continue_mode)
+        start_time = time.time()
+        output_file = download_full_chain_optimized(args.symbol, args.output)
+        elapsed = time.time() - start_time
 
         if output_file:
-            print(f"\n🎉 Success! Data saved to {output_file}")
-            if args.continue_mode:
-                print(f"💡 Tip: Data was appended to existing file")
+            print(f"Success! Data saved to {output_file}")
+            print(f"Total time: {elapsed:.1f} seconds")
             sys.exit(0)
         else:
             sys.exit(1)
 
     except KeyboardInterrupt:
-        print("\n\n⚠️  Download interrupted by user")
-        if args.output:
-            print(f"💾 Partial data saved to: {args.output}")
-            print(f"🔄 Resume with: python download_options_chain.py {args.symbol} --continue --csv {args.output}")
+        print("\n\nDownload interrupted by user")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
+        print(f"\nUnexpected error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
     finally:
         # Logout
@@ -328,6 +272,7 @@ Note: You must run setup_auth.py first to authenticate with Robinhood.
             rh.logout()
         except:
             pass
+
 
 if __name__ == "__main__":
     main()
